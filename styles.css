@@ -1,0 +1,169 @@
+/* LM Studio Notes plugin styles */
+
+.lmstudio-notes-prompt {
+	width: 100%;
+}
+
+/* --- Chat pane --- */
+
+.lmstudio-notes-chat {
+	display: flex;
+	flex-direction: column;
+	height: 100%;
+	padding: 0;
+}
+
+.lmstudio-notes-chat-header {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	padding: var(--size-4-2) var(--size-4-3);
+	border-bottom: 1px solid var(--background-modifier-border);
+}
+
+.lmstudio-notes-chat-title {
+	font-weight: var(--font-semibold);
+}
+
+.lmstudio-notes-chat-controls {
+	display: flex;
+	align-items: center;
+	gap: var(--size-4-1);
+}
+
+.lmstudio-notes-context-toggle {
+	display: inline-flex;
+	align-items: center;
+	gap: var(--size-2-1);
+	font-size: var(--font-ui-smaller);
+	padding: var(--size-2-1) var(--size-4-1);
+	color: var(--text-muted);
+	background: transparent;
+	box-shadow: none;
+	cursor: pointer;
+}
+
+.lmstudio-notes-context-toggle:hover {
+	color: var(--text-normal);
+	background-color: var(--background-modifier-hover);
+}
+
+.lmstudio-notes-context-icon {
+	display: inline-flex;
+}
+
+.lmstudio-notes-context-icon svg {
+	width: var(--icon-s);
+	height: var(--icon-s);
+}
+
+.lmstudio-notes-chat-messages {
+	flex: 1 1 auto;
+	overflow-y: auto;
+	padding: var(--size-4-3);
+	display: flex;
+	flex-direction: column;
+	gap: var(--size-4-2);
+	font-size: var(--lmstudio-chat-font-size, var(--font-ui-medium));
+	/* Allow selecting/copying chat text (Obsidian disables this by default). */
+	user-select: text;
+	-webkit-user-select: text;
+}
+
+.lmstudio-notes-msg {
+	position: relative;
+	border-radius: var(--radius-m);
+	padding: var(--size-4-2) var(--size-4-3);
+	max-width: 100%;
+	overflow-wrap: anywhere;
+}
+
+.lmstudio-notes-msg-content > :first-child {
+	margin-top: 0;
+}
+
+.lmstudio-notes-msg-content > :last-child {
+	margin-bottom: 0;
+}
+
+.lmstudio-notes-msg-actions {
+	position: absolute;
+	top: var(--size-2-1);
+	right: var(--size-2-1);
+	display: none;
+	gap: var(--size-2-1);
+	user-select: none;
+}
+
+.lmstudio-notes-msg:hover .lmstudio-notes-msg-actions {
+	display: flex;
+}
+
+.lmstudio-notes-msg-actions button {
+	background-color: var(--background-primary);
+}
+
+.lmstudio-notes-edit-input {
+	width: 100%;
+	resize: vertical;
+	font-family: inherit;
+	font-size: var(--lmstudio-chat-font-size, var(--font-ui-medium));
+}
+
+.lmstudio-notes-edit-actions {
+	display: flex;
+	gap: var(--size-4-2);
+	justify-content: flex-end;
+	margin-top: var(--size-4-1);
+}
+
+.lmstudio-notes-user {
+	background-color: var(--background-modifier-hover);
+	align-self: flex-end;
+}
+
+.lmstudio-notes-assistant {
+	background-color: var(--background-secondary);
+}
+
+.lmstudio-notes-tool {
+	font-size: var(--font-ui-smaller);
+	color: var(--text-muted);
+	font-family: var(--font-monospace);
+	padding: var(--size-2-1) var(--size-4-3);
+}
+
+.lmstudio-notes-error {
+	background-color: var(--background-modifier-error);
+	color: var(--text-error);
+}
+
+.lmstudio-notes-thinking {
+	color: var(--text-muted);
+	font-style: italic;
+}
+
+.lmstudio-notes-chat-input {
+	display: flex;
+	gap: var(--size-4-2);
+	padding: var(--size-4-3);
+	border-top: 1px solid var(--background-modifier-border);
+}
+
+.lmstudio-notes-chat-input textarea {
+	flex: 1 1 auto;
+	resize: vertical;
+	min-height: 2.5em;
+	font-family: inherit;
+	font-size: var(--lmstudio-chat-font-size, var(--font-ui-medium));
+}
+
+.lmstudio-notes-confirm-detail {
+	white-space: pre-wrap;
+	overflow-wrap: anywhere;
+	max-height: 40vh;
+	overflow-y: auto;
+	background-color: var(--background-secondary);
+	padding: var(--size-4-2);
+	border-radius: var(--radius-s);
+}
