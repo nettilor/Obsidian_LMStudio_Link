@@ -19,11 +19,12 @@ LM Studio is an MCP **host/client** and a local **OpenAI-compatible server** —
 **Chat with your vault**
 
 - A **chat side-pane** (speech-bubble ribbon icon, or the **Open chat** command) where you talk to your local model. It's automatically aware of your notes — choose **None**, **Active note**, or **All open notes** as context under Settings → Chat → **Note context**.
+- **Vault context** (Settings → Vault context): a free-text **Vault notes** field for conventions the model should always know (folder layout, naming formats, templates), plus an automatic **current date & ISO week** line so "this week" / "last week" resolve to e.g. `2026-W26`. This is what makes tasks like *"move incomplete tasks from last week's note into this week's"* work.
 - The model can call **tools** to read and edit your vault:
   - Read: `get_active_note`, `read_note`, `search_vault`, `list_vault_notes`
   - Graph: `get_note_links` (backlinks/outgoing), `find_related_notes`, `get_note_outline`, `find_notes_by_tag`, `find_notes_by_property`, `get_recent_notes`
   - Semantic: `semantic_search` (meaning-based search over a local embedding index)
-  - Edit: `replace_selection`, `insert_into_active_note`, `append_to_note`, `update_frontmatter`, `create_note`
+  - Edit: `replace_selection`, `insert_into_active_note`, `append_to_note`, `replace_in_note` (find/replace or delete content in any note by path), `update_frontmatter`, `create_note`
 - **Tool control** — a tools dropdown (in the chat header and under Settings → Tools) lets you enable/disable groups of tools (Reading / Search / Graph / Editing). Disable the read tools when you already inject note content as context, or disable editing for a read-only session.
 - **Edits are gated for safety** — every write asks for confirmation by default (toggle in settings).
 
@@ -73,7 +74,7 @@ Open **Settings → LM Studio Notes**:
 
 - Click the speech-bubble ribbon icon (or run **Open chat**) to open the chat pane.
 - Ask about the current note ("summarize the key points of this note", "what are the open questions here?") or ask the model to edit ("add a `status: draft` property", "append a TODO section", "tighten the selected paragraph").
-- When the model wants to write to the vault, a confirmation dialog shows exactly what it will do — approve or cancel. Use **New chat** (the + button) to start a fresh conversation.
+- When the model wants to write to the vault, a confirmation dialog shows a **git-style diff** (lines added/removed) of the exact change — approve or cancel. Use **New chat** (the + button) to start a fresh conversation.
 - **Select and copy** any chat text, or use the hover **copy** button on a message to grab its raw markdown for pasting into a note.
 - **Edit & re-run**: hover a message you sent and click the **pencil** to edit it; saving re-runs the conversation from that point so you can fine-tune the prompt (Cmd/Ctrl+Enter to submit, Esc to cancel).
 - **Tool activity is folded**: the model's tool calls collapse into a single expandable row (closed by default) so the conversation stays readable — expand it to see exactly what it did.

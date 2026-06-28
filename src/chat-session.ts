@@ -4,6 +4,13 @@ import { describeError, WireMessage } from './lmstudio';
 import { getActiveNote } from './note-context';
 import { confirmEdit } from './confirm-modal';
 import { executeTool, ToolContext, toolDefsFor } from './tools';
+import { hasToolCallMarkers, recoverToolCalls } from './tool-call-recovery';
+
+const TOOL_PARSE_HELP =
+	'The model emitted a tool call the local server could not parse (common with ' +
+	'gpt-oss / harmony-format models) and it could not be recovered. Try enabling ' +
+	'fewer tools (the wrench menu), updating LM Studio, or using a model with native ' +
+	'tool-call support.';
 
 /** Safety cap on how many tool round-trips a single user turn may trigger. */
 const MAX_TOOL_ITERATIONS = 6;
@@ -99,7 +106,12 @@ export class ChatSession {
 		this.onUpdate();
 
 		try {
-			// Note context is computed once and prepended fresh each request.
+			// Context (vault facts, date, note content) — computed once, prepended fresh.
+			const systemExtras: WireMessage[] = [];
+			const guide = this.vaultGuideMessage();
+			if (guide) systemExtras.push(guide);
+			const dateMsg = this.dateContextMessage();
+			if (dateMsg) systemExtras.push(dateMsg);
 			const context = await this.notesContext();
 			const tools = toolDefsFor(settings);
 			const ctx: ToolContext = { app, plugin: this.plugin };
@@ -107,6 +119,7 @@ export class ChatSession {
 			const buildOutgoing = (): WireMessage[] => {
 				const msgs: WireMessage[] = [
 					{ role: 'system', content: settings.chatSystemPrompt },
+					...systemExtras,
 				];
 				if (context) msgs.push(context);
 				msgs.push(...this.historyForSend());
@@ -120,25 +133,43 @@ export class ChatSession {
 					temperature: settings.temperature,
 					tools,
 				});
-				const calls = message.tool_calls ?? [];
+				let calls = message.tool_calls ?? [];
+				let content = message.content;
+				let brokenToolCall = false;
+
+				// Recover tool calls the server leaked into text (gpt-oss/harmony).
+				if (calls.length === 0 && content && hasToolCallMarkers(content)) {
+					const recovered = recoverToolCalls(content);
+					if (recovered.length > 0) {
+						calls = recovered;
+						content = null; // the text WAS the tool call; don't show it
+					} else {
+						brokenToolCall = true;
+					}
+				}
+
 				// Keep stored assistant messages wire-valid for replay: only include
 				// tool_calls when present, and never store null content otherwise.
 				turn.wire.push(
 					calls.length
-						? { role: 'assistant', content: message.content, tool_calls: message.tool_calls }
-						: { role: 'assistant', content: message.content ?? '' },
+						? { role: 'assistant', content, tool_calls: calls }
+						: { role: 'assistant', content: brokenToolCall ? '' : content ?? '' },
 				);
 
 				if (calls.length === 0) {
-					const final = (message.content ?? '').trim();
-					turn.display.push({ role: 'assistant', text: final || '(no response)' });
+					if (brokenToolCall) {
+						turn.display.push({ role: 'error', text: TOOL_PARSE_HELP });
+					} else {
+						const final = (content ?? '').trim();
+						turn.display.push({ role: 'assistant', text: final || '(no response)' });
+					}
 					this.onUpdate();
 					answered = true;
 					break;
 				}
 
-				if (message.content && message.content.trim()) {
-					turn.display.push({ role: 'assistant', text: message.content });
+				if (content && content.trim()) {
+					turn.display.push({ role: 'assistant', text: content });
 					this.onUpdate();
 				}
 
@@ -147,7 +178,7 @@ export class ChatSession {
 					this.onUpdate();
 
 					const result = await executeTool(ctx, call, {
-						confirm: (title, detail) => confirmEdit(app, title, detail),
+						confirm: (req) => confirmEdit(app, req),
 					});
 
 					turn.wire.push({ role: 'tool', content: result, tool_call_id: call.id });
@@ -206,6 +237,28 @@ export class ChatSession {
 			size += turnSize;
 		}
 		return included.flatMap((t) => t.wire);
+	}
+
+	/** Persistent, user-authored facts about the vault. */
+	private vaultGuideMessage(): WireMessage | null {
+		const guide = this.plugin.settings.vaultGuide.trim();
+		if (!guide) return null;
+		return { role: 'system', content: `Facts about this vault (always apply):\n${guide}` };
+	}
+
+	/** Today's date and the current/adjacent ISO weeks, so temporal refs resolve. */
+	private dateContextMessage(): WireMessage | null {
+		if (!this.plugin.settings.includeDateContext) return null;
+		const now = new Date();
+		const weekday = now.toLocaleDateString(undefined, { weekday: 'long' });
+		return {
+			role: 'system',
+			content:
+				`Today's date is ${formatDate(now)} (${weekday}). ` +
+				`The current ISO week is ${isoWeekString(now)} ` +
+				`(last week ${isoWeekString(addDays(now, -7))}, next week ${isoWeekString(addDays(now, 7))}). ` +
+				'Use these when the user refers to today, this week, last week, etc.',
+		};
 	}
 
 	/** A fresh system message describing the note context, regenerated each send. */
@@ -324,4 +377,30 @@ function firstLine(s: string): string {
 
 function clampText(text: string, max: number): string {
 	return text.length > max ? `${text.slice(0, max)}\n…[truncated]` : text;
+}
+
+function pad2(n: number): string {
+	return String(n).padStart(2, '0');
+}
+
+function formatDate(d: Date): string {
+	return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+}
+
+function addDays(d: Date, days: number): Date {
+	const r = new Date(d.getTime());
+	r.setDate(r.getDate() + days);
+	return r;
+}
+
+/** ISO-8601 week as "YYYY-Www" (e.g. 2026-W26), using the ISO week-year. */
+function isoWeekString(date: Date): string {
+	const d = new Date(Date.UTC(date.getFullYear(), date.getMonth(), date.getDate()));
+	const dayNum = (d.getUTCDay() + 6) % 7; // Mon=0 .. Sun=6
+	d.setUTCDate(d.getUTCDate() - dayNum + 3); // Thursday of this week
+	const firstThursday = new Date(Date.UTC(d.getUTCFullYear(), 0, 4));
+	const ftDayNum = (firstThursday.getUTCDay() + 6) % 7;
+	firstThursday.setUTCDate(firstThursday.getUTCDate() - ftDayNum + 3);
+	const week = 1 + Math.round((d.getTime() - firstThursday.getTime()) / (7 * 86_400_000));
+	return `${d.getUTCFullYear()}-W${pad2(week)}`;
 }

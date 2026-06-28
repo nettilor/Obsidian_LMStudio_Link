@@ -46,7 +46,7 @@ export async function getActiveNote(app: App): Promise<ActiveNote | null> {
 }
 
 /** Find a loaded MarkdownView showing `file`, checking the active view first. */
-function findMarkdownViewForFile(app: App, file: TFile): MarkdownView | null {
+export function findMarkdownViewForFile(app: App, file: TFile): MarkdownView | null {
 	const active = app.workspace.getActiveViewOfType(MarkdownView);
 	if (active && active.file === file) return active;
 	for (const leaf of app.workspace.getLeavesOfType('markdown')) {

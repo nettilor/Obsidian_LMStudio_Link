@@ -212,3 +212,74 @@
 	padding: var(--size-4-2);
 	border-radius: var(--radius-s);
 }
+
+/* --- Diff preview in the edit-confirmation modal --- */
+
+.lmstudio-notes-diff-modal {
+	width: min(820px, 90vw);
+}
+
+.lmstudio-notes-diff-head {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: var(--size-4-2);
+	margin-bottom: var(--size-4-2);
+	font-size: var(--font-ui-small);
+}
+
+.lmstudio-notes-diff-path {
+	font-family: var(--font-monospace);
+	color: var(--text-muted);
+	overflow-wrap: anywhere;
+}
+
+.lmstudio-notes-diff-stat {
+	font-family: var(--font-monospace);
+	white-space: nowrap;
+	color: var(--text-muted);
+}
+
+.lmstudio-notes-diff {
+	max-height: 50vh;
+	overflow: auto;
+	border: 1px solid var(--background-modifier-border);
+	border-radius: var(--radius-s);
+	background-color: var(--background-primary-alt);
+	font-family: var(--font-monospace);
+	font-size: var(--font-ui-smaller);
+	padding: var(--size-2-2) 0;
+}
+
+.lmstudio-notes-diff-row {
+	display: flex;
+	gap: var(--size-2-2);
+	padding: 0 var(--size-4-2);
+	white-space: pre-wrap;
+	overflow-wrap: anywhere;
+}
+
+.lmstudio-notes-diff-marker {
+	flex: 0 0 1ch;
+	text-align: center;
+	opacity: 0.7;
+	user-select: none;
+}
+
+.lmstudio-notes-diff-text {
+	flex: 1 1 auto;
+}
+
+.lmstudio-notes-diff-add {
+	background-color: rgba(var(--color-green-rgb), 0.15);
+}
+
+.lmstudio-notes-diff-del {
+	background-color: rgba(var(--color-red-rgb), 0.15);
+}
+
+.lmstudio-notes-diff-gap {
+	color: var(--text-faint);
+	font-style: italic;
+	justify-content: center;
+}

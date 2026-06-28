@@ -25,6 +25,10 @@ export interface LMStudioNotesSettings {
 	summaryAsCallout: boolean;
 	/** System prompt for the chat pane. */
 	chatSystemPrompt: string;
+	/** Free-text facts about the vault (conventions, structure) injected into chat. */
+	vaultGuide: string;
+	/** Inject today's date and the current/adjacent ISO weeks into chat context. */
+	includeDateContext: boolean;
 	/** Which note content to auto-include as chat context. */
 	noteContext: NoteContextMode;
 	/** Names of tools the model is not allowed to use. */
@@ -61,6 +65,8 @@ export const DEFAULT_SETTINGS: LMStudioNotesSettings = {
 	summaryInsertLocation: 'top',
 	summaryAsCallout: true,
 	chatSystemPrompt: DEFAULT_CHAT_PROMPT,
+	vaultGuide: '',
+	includeDateContext: true,
 	noteContext: 'active',
 	disabledTools: [],
 	requireWriteConfirmation: true,
@@ -295,6 +301,45 @@ export class LMStudioNotesSettingTab extends PluginSettingTab {
 						this.plugin.settings.noteContext = value as NoteContextMode;
 						await this.plugin.saveSettings();
 						this.plugin.refreshChatViews();
+					}),
+			);
+
+		new Setting(containerEl).setName('Vault context').setHeading();
+
+		new Setting(containerEl)
+			.setName('Vault notes')
+			.setDesc(
+				'Facts about your vault the model should always know — folder layout, ' +
+					'naming conventions, templates. Injected into every chat.',
+			)
+			.addTextArea((area) => {
+				area.inputEl.rows = 5;
+				area.inputEl.addClass('lmstudio-notes-prompt');
+				area.setPlaceholder(
+					'e.g. Weekly notes are in Journal/Weekly, named "YYYY-Www" (e.g. 2026-W26).\n' +
+						'Daily notes are in Journal/Daily, named YYYY-MM-DD.\n' +
+						'Tasks use "- [ ]" checkboxes.',
+				);
+				area
+					.setValue(this.plugin.settings.vaultGuide)
+					.onChange(async (value) => {
+						this.plugin.settings.vaultGuide = value;
+						await this.plugin.saveSettings();
+					});
+			});
+
+		new Setting(containerEl)
+			.setName('Include current date & week')
+			.setDesc(
+				"Tell the model today's date and the current/last/next ISO week (e.g. " +
+					'2026-W26), so "this week" / "last week" resolve correctly.',
+			)
+			.addToggle((toggle) =>
+				toggle
+					.setValue(this.plugin.settings.includeDateContext)
+					.onChange(async (value) => {
+						this.plugin.settings.includeDateContext = value;
+						await this.plugin.saveSettings();
 					}),
 			);
 

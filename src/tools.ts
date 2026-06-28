@@ -1,8 +1,15 @@
 import { App, getAllTags, MarkdownView, normalizePath, TFile } from 'obsidian';
 import type LMStudioNotesPlugin from './main';
 import { ToolCall, ToolDef } from './lmstudio';
-import { getActiveNote, insertIntoNote, InsertLocation } from './note-context';
+import {
+	findMarkdownViewForFile,
+	getActiveNote,
+	insertIntoNote,
+	InsertLocation,
+} from './note-context';
 import { LMStudioNotesSettings } from './settings';
+import { lineDiff } from './diff';
+import type { ConfirmRequest } from './confirm-modal';
 
 /** How much note text a read tool returns at most, to protect the context window. */
 const TOOL_MAX_CHARS = 16_000;
@@ -12,15 +19,28 @@ export interface ToolContext {
 	plugin: LMStudioNotesPlugin;
 }
 
+/** A previewable edit: before/after text plus the action that applies it. */
+export interface EditPlan {
+	/** Human-readable target, e.g. the note path. */
+	label: string;
+	before: string;
+	after: string;
+	/** Perform the edit and return the tool-result message. */
+	apply(): Promise<string>;
+}
+
 export interface Tool {
 	def: ToolDef;
 	/** Whether the tool mutates the vault (gated by settings + confirmation). */
 	write: boolean;
 	/** Optional gate: when present and false, the tool is not advertised. */
 	enabled?(settings: LMStudioNotesSettings): boolean;
-	/** Human-readable description of the pending action, for the confirm dialog. */
+	/** Human-readable description of the pending action, for the simple confirm path. */
 	describe?(args: Record<string, unknown>): string;
-	run(ctx: ToolContext, args: Record<string, unknown>): Promise<string>;
+	/** Compute a diff-previewable plan; return a string to signal an error. */
+	plan?(ctx: ToolContext, args: Record<string, unknown>): Promise<EditPlan | string>;
+	/** Run directly (reads, and writes that aren't diff-previewed). */
+	run?(ctx: ToolContext, args: Record<string, unknown>): Promise<string>;
 }
 
 // --- small arg/helpers -----------------------------------------------------
@@ -68,6 +88,14 @@ function preview(text: string | undefined): string {
 
 function ensureMd(path: string): string {
 	return /\.md$/i.test(path) ? path : `${path}.md`;
+}
+
+/** Literal (non-regex) find/replace so `$` and friends aren't interpreted. */
+function applyReplace(data: string, find: string, replace: string, all: boolean): string {
+	if (all) return data.split(find).join(replace);
+	const idx = data.indexOf(find);
+	if (idx === -1) return data;
+	return data.slice(0, idx) + replace + data.slice(idx + find.length);
 }
 
 /** Resolve a vault-relative path or a note name/link to a file (for reads). */
@@ -484,16 +512,23 @@ export const ALL_TOOLS: Record<string, Tool> = {
 				),
 			},
 		},
-		describe: (args) => `Replace the current selection with:\n\n${preview(str(args, 'text'))}`,
-		run: async ({ app }, args) => {
+		plan: async ({ app }, args) => {
 			const text = str(args, 'text');
 			if (text === undefined) return 'Error: missing "text".';
 			const view = app.workspace.getActiveViewOfType(MarkdownView);
 			if (!view) return 'Error: no active markdown editor.';
 			const editor = view.editor;
-			if (!editor.getSelection()) return 'Error: nothing is selected in the active editor.';
-			editor.replaceSelection(text);
-			return 'Replaced the selection.';
+			const selection = editor.getSelection();
+			if (!selection) return 'Error: nothing is selected in the active editor.';
+			return {
+				label: `${view.file?.path ?? 'active note'} (selection)`,
+				before: selection,
+				after: text,
+				apply: () => {
+					editor.replaceSelection(text);
+					return Promise.resolve('Replaced the selection.');
+				},
+			};
 		},
 	},
 
@@ -548,8 +583,7 @@ export const ALL_TOOLS: Record<string, Tool> = {
 				),
 			},
 		},
-		describe: (args) => `Append to "${str(args, 'path')}":\n\n${preview(str(args, 'text'))}`,
-		run: async ({ app }, args) => {
+		plan: async ({ app }, args) => {
 			const path = str(args, 'path');
 			const text = str(args, 'text');
 			if (!path || text === undefined) return 'Error: missing "path" or "text".';
@@ -557,8 +591,17 @@ export const ALL_TOOLS: Record<string, Tool> = {
 			if (!file) {
 				return `No note at exact path "${path}". Provide the full vault path, e.g. "Folder/Note.md".`;
 			}
-			await app.vault.append(file, text.startsWith('\n') ? text : `\n${text}`);
-			return `Appended to "${file.path}".`;
+			const before = await app.vault.read(file);
+			const appended = text.startsWith('\n') ? text : `\n${text}`;
+			return {
+				label: file.path,
+				before,
+				after: before + appended,
+				apply: async () => {
+					await app.vault.append(file, appended);
+					return `Appended to "${file.path}".`;
+				},
+			};
 		},
 	},
 
@@ -617,22 +660,94 @@ export const ALL_TOOLS: Record<string, Tool> = {
 				),
 			},
 		},
-		describe: (args) => `Create a new note at "${ensureMd(str(args, 'path') ?? '')}".`,
-		run: async ({ app }, args) => {
+		plan: async ({ app }, args) => {
 			const rawPath = str(args, 'path');
 			if (!rawPath) return 'Error: missing "path".';
 			const path = normalizePath(ensureMd(rawPath));
 			if (app.vault.getAbstractFileByPath(path)) return `A file already exists at ${path}.`;
-			const folder = path.split('/').slice(0, -1).join('/');
-			try {
-				if (folder && !app.vault.getAbstractFileByPath(folder)) {
-					await app.vault.createFolder(folder);
-				}
-				const file = await app.vault.create(path, str(args, 'content') ?? '');
-				return `Created note "${file.path}".`;
-			} catch (e) {
-				return `Error creating note: ${(e as Error).message}`;
+			const content = str(args, 'content') ?? '';
+			return {
+				label: path,
+				before: '',
+				after: content,
+				apply: async () => {
+					const folder = path.split('/').slice(0, -1).join('/');
+					if (folder && !app.vault.getAbstractFileByPath(folder)) {
+						await app.vault.createFolder(folder);
+					}
+					const file = await app.vault.create(path, content);
+					return `Created note "${file.path}".`;
+				},
+			};
+		},
+	},
+
+	replace_in_note: {
+		write: true,
+		def: {
+			type: 'function',
+			function: {
+				name: 'replace_in_note',
+				description:
+					'Find and replace exact text in a note by path — the note does NOT need to be open. Use this to edit or REMOVE content anywhere in any note (e.g. delete task lines that were moved elsewhere). Read the note first to get the exact text; include trailing newlines to delete whole lines. Replace with an empty string to delete the matched text.',
+				parameters: objectSchema(
+					{
+						path: { type: 'string', description: 'Vault path of the note to edit.' },
+						find: { type: 'string', description: 'Exact text to find (verbatim, not a pattern).' },
+						replace: {
+							type: 'string',
+							description: 'Replacement text. Use an empty string to delete the matched text.',
+						},
+						all: {
+							type: 'boolean',
+							description: 'Replace every occurrence (default false = first match only).',
+						},
+					},
+					['path', 'find'],
+				),
+			},
+		},
+		plan: async ({ app }, args) => {
+			const path = str(args, 'path');
+			const find = str(args, 'find');
+			if (!path || find === undefined) return 'Error: missing "path" or "find".';
+			if (find === '') return 'Error: "find" must not be empty.';
+			const replace = str(args, 'replace') ?? '';
+			const all = args.all === true;
+
+			const file = resolveFileStrict(app, path);
+			if (!file) {
+				return `No note at exact path "${path}". Provide the full vault path, e.g. "Folder/Note.md".`;
 			}
+
+			// Prefer the live editor when the note is open (undoable, respects
+			// unsaved edits); otherwise read/write the file directly.
+			const view = findMarkdownViewForFile(app, file);
+			const before = view ? view.editor.getValue() : await app.vault.read(file);
+			if (!before.includes(find)) {
+				return `Text not found in "${file.path}". Read the note to get the exact text.`;
+			}
+			const after = applyReplace(before, find, replace, all);
+			const count = all ? before.split(find).length - 1 : 1;
+			return {
+				label: file.path,
+				before,
+				after,
+				apply: async () => {
+					if (view) {
+						const current = view.editor.getValue();
+						if (!current.includes(find)) {
+							return `Text not found in "${file.path}" (it changed). Re-read and try again.`;
+						}
+						view.editor.setValue(applyReplace(current, find, replace, all));
+					} else {
+						await app.vault.process(file, (data) =>
+							data.includes(find) ? applyReplace(data, find, replace, all) : data,
+						);
+					}
+					return `Replaced ${count} occurrence(s) in "${file.path}".`;
+				},
+			};
 		},
 	},
 };
@@ -658,6 +773,7 @@ const TOOL_GROUP_MAP: Record<string, ToolGroup> = {
 	append_to_note: 'Editing',
 	update_frontmatter: 'Editing',
 	create_note: 'Editing',
+	replace_in_note: 'Editing',
 };
 
 export const ALL_TOOL_NAMES = Object.keys(ALL_TOOLS);
@@ -699,7 +815,7 @@ export function toolDefsFor(settings: LMStudioNotesSettings): ToolDef[] {
 }
 
 export interface ToolRunOptions {
-	confirm: (title: string, detail: string) => Promise<boolean>;
+	confirm: (req: ConfirmRequest) => Promise<boolean>;
 }
 
 /**
@@ -733,11 +849,40 @@ export async function executeTool(
 		return `Error: the "${call.function.name}" tool is currently unavailable.`;
 	}
 
+	// Plan-based path: compute before/after, confirm with a diff, then apply.
+	if (tool.plan) {
+		let plan: EditPlan | string;
+		try {
+			plan = await tool.plan(ctx, args);
+		} catch (e) {
+			return `Error: ${(e as Error).message}`;
+		}
+		if (typeof plan === 'string') return plan;
+
+		if (tool.write && settings.requireWriteConfirmation) {
+			const diff = lineDiff(plan.before, plan.after);
+			const approved = await opts.confirm({
+				title: 'Apply this edit?',
+				label: plan.label,
+				diff,
+			});
+			if (!approved) return 'The user declined this edit.';
+		}
+		try {
+			return await plan.apply();
+		} catch (e) {
+			return `Error: ${(e as Error).message}`;
+		}
+	}
+
+	if (!tool.run) {
+		return `Error: the "${call.function.name}" tool has no implementation.`;
+	}
 	if (tool.write && settings.requireWriteConfirmation) {
 		const detail = tool.describe
 			? tool.describe(args)
 			: `${call.function.name}(${call.function.arguments})`;
-		const approved = await opts.confirm('Allow this edit?', detail);
+		const approved = await opts.confirm({ title: 'Allow this edit?', detail });
 		if (!approved) return 'The user declined this edit.';
 	}
 
