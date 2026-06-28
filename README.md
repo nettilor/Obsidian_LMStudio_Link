@@ -18,7 +18,7 @@ LM Studio is an MCP **host/client** and a local **OpenAI-compatible server** —
 
 **Chat with your vault**
 
-- A **chat side-pane** (speech-bubble ribbon icon, or the **Open chat** command) where you talk to your local model. It's automatically aware of your notes — choose **None**, **Active note**, or **All open notes** as context under Settings → Chat → **Note context**.
+- A **chat side-pane** (speech-bubble ribbon icon, or the **Open chat** command) where you talk to your local model. It's automatically aware of your notes — choose **None**, **Active note**, **All open notes**, or **Current note + links** as context under Settings → Chat → **Note context**. "Current note + links" pulls in the most relevant related notes — its forward/back links and tag-related notes, ranked by relevance (rare shared tags weigh most, then links), capped and tunable in settings. Lightweight RAG over your vault's own structure.
 - **Vault context** (Settings → Vault context): a free-text **Vault notes** field for conventions the model should always know (folder layout, naming formats, templates), plus an automatic **current date & ISO week** line so "this week" / "last week" resolve to e.g. `2026-W26`. This is what makes tasks like *"move incomplete tasks from last week's note into this week's"* work.
 - The model can call **tools** to read and edit your vault:
   - Read: `get_active_note`, `read_note`, `search_vault`, `list_vault_notes`

@@ -12,6 +12,7 @@ const CONTEXT_MODES: Array<{ mode: NoteContextMode; icon: string; label: string 
 	{ mode: 'none', icon: 'circle-slash', label: 'No context' },
 	{ mode: 'active', icon: 'file', label: 'Active note' },
 	{ mode: 'open', icon: 'files', label: 'All open notes' },
+	{ mode: 'linked', icon: 'link', label: 'Note + links' },
 ];
 
 /** The in-Obsidian chat pane that drives the local model and its tools. */
@@ -161,6 +162,9 @@ export class ChatView extends ItemView {
 					i++;
 				}
 				this.renderToolGroup(group);
+			} else if (item.role === 'context') {
+				this.renderContextFold(item);
+				i++;
 			} else {
 				this.renderItem(item);
 				i++;
@@ -201,6 +205,20 @@ export class ChatView extends ItemView {
 
 		if (item.role === 'assistant' || item.role === 'user') {
 			this.renderActions(el, item);
+		}
+	}
+
+	/** Render the injected-context notes as a single fold, collapsed by default. */
+	private renderContextFold(item: DisplayItem): void {
+		const sources = item.sources ?? [];
+		const details = this.messagesEl.createEl('details', { cls: 'lmstudio-notes-tools' });
+		const summary = details.createEl('summary', { cls: 'lmstudio-notes-tools-summary' });
+		setIcon(summary.createSpan({ cls: 'lmstudio-notes-tools-chevron' }), 'chevron-right');
+		summary.createSpan({
+			text: `Context: ${sources.length} note${sources.length === 1 ? '' : 's'}`,
+		});
+		for (const s of sources) {
+			details.createDiv({ cls: 'lmstudio-notes-tool-line', text: s });
 		}
 	}
 

@@ -103,12 +103,37 @@ export default class LMStudioNotesPlugin extends Plugin {
 		}
 		delete (this.settings as { enableEditingTools?: boolean }).enableEditingTools;
 
+		// Migrate the pre-0.10 separate link/tag caps into one relevance cap.
+		const legacyLinked = loaded as { linkedMaxLinks?: number; linkedMaxTagged?: number };
+		if (
+			loaded.linkedMaxNotes === undefined &&
+			(legacyLinked.linkedMaxLinks !== undefined || legacyLinked.linkedMaxTagged !== undefined)
+		) {
+			this.settings.linkedMaxNotes = Math.min(
+				30,
+				(legacyLinked.linkedMaxLinks ?? 5) + (legacyLinked.linkedMaxTagged ?? 5),
+			);
+		}
+		delete (this.settings as { linkedMaxLinks?: number }).linkedMaxLinks;
+		delete (this.settings as { linkedMaxTagged?: number }).linkedMaxTagged;
+
 		// Coerce out-of-range persisted values back to defaults.
-		if (!['none', 'active', 'open'].includes(this.settings.noteContext)) {
+		if (!['none', 'active', 'open', 'linked'].includes(this.settings.noteContext)) {
 			this.settings.noteContext = DEFAULT_SETTINGS.noteContext;
 		}
 		if (!Array.isArray(this.settings.disabledTools)) {
 			this.settings.disabledTools = [];
+		}
+		if (
+			typeof this.settings.linkedMaxNotes !== 'number' ||
+			!Number.isFinite(this.settings.linkedMaxNotes)
+		) {
+			this.settings.linkedMaxNotes = DEFAULT_SETTINGS.linkedMaxNotes;
+		} else {
+			this.settings.linkedMaxNotes = Math.min(
+				30,
+				Math.max(0, Math.round(this.settings.linkedMaxNotes)),
+			);
 		}
 	}
 

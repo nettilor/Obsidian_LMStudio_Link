@@ -6,7 +6,7 @@ import { toolCatalog } from './tools';
 import { openToolsMenu } from './tool-menu';
 
 /** Which note content is auto-injected into chat context. */
-export type NoteContextMode = 'none' | 'active' | 'open';
+export type NoteContextMode = 'none' | 'active' | 'open' | 'linked';
 
 export interface LMStudioNotesSettings {
 	/** OpenAI-compatible base URL. `/v1` is appended automatically if omitted. */
@@ -31,6 +31,10 @@ export interface LMStudioNotesSettings {
 	includeDateContext: boolean;
 	/** Which note content to auto-include as chat context. */
 	noteContext: NoteContextMode;
+	/** "Current note + links" mode: max related notes to inject (ranked by relevance). */
+	linkedMaxNotes: number;
+	/** "Current note + links" mode: also follow links 2 hops out. */
+	linkedTwoHop: boolean;
 	/** Names of tools the model is not allowed to use. */
 	disabledTools: string[];
 	/** Ask for confirmation before any tool writes to the vault. */
@@ -68,6 +72,8 @@ export const DEFAULT_SETTINGS: LMStudioNotesSettings = {
 	vaultGuide: '',
 	includeDateContext: true,
 	noteContext: 'active',
+	linkedMaxNotes: 8,
+	linkedTwoHop: false,
 	disabledTools: [],
 	requireWriteConfirmation: true,
 	embeddingModel: '',
@@ -288,19 +294,52 @@ export class LMStudioNotesSettingTab extends PluginSettingTab {
 			.setName('Note context')
 			.setDesc(
 				'Which note content to automatically include so the model knows what ' +
-					'you are working on. "All open notes" sends every note open in a tab ' +
-					'(active one first), within a size budget.',
+					'you are working on. "All open notes" sends every open tab; ' +
+					'"Current note + links" adds the note\'s linked and tag-related notes.',
 			)
 			.addDropdown((dropdown) =>
 				dropdown
 					.addOption('none', 'None')
 					.addOption('active', 'Active note')
 					.addOption('open', 'All open notes')
+					.addOption('linked', 'Current note + links')
 					.setValue(this.plugin.settings.noteContext)
 					.onChange(async (value) => {
 						this.plugin.settings.noteContext = value as NoteContextMode;
 						await this.plugin.saveSettings();
 						this.plugin.refreshChatViews();
+					}),
+			);
+
+		new Setting(containerEl)
+			.setName('Linked context: max related notes')
+			.setDesc(
+				'For "Current note + links": how many related notes to include, ranked ' +
+					'by relevance — rare shared tags weigh most, then links.',
+			)
+			.addSlider((slider) =>
+				slider
+					.setLimits(0, 30, 1)
+					.setValue(this.plugin.settings.linkedMaxNotes)
+					.setDynamicTooltip()
+					.onChange(async (value) => {
+						this.plugin.settings.linkedMaxNotes = value;
+						await this.plugin.saveSettings();
+					}),
+			);
+
+		new Setting(containerEl)
+			.setName('Linked context: follow links 2 hops')
+			.setDesc(
+				'For "Current note + links": also include notes linked from the linked ' +
+					'notes (still capped by the linked-notes limit above).',
+			)
+			.addToggle((toggle) =>
+				toggle
+					.setValue(this.plugin.settings.linkedTwoHop)
+					.onChange(async (value) => {
+						this.plugin.settings.linkedTwoHop = value;
+						await this.plugin.saveSettings();
 					}),
 			);
 
