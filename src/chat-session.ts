@@ -21,6 +21,8 @@ export interface DisplayItem {
 	text: string;
 	/** Set on user messages so the view can offer "edit & re-run" for that turn. */
 	turnIndex?: number;
+	/** Set on tool items whose result was an error, for styling within the fold. */
+	isError?: boolean;
 }
 
 /**
@@ -299,9 +301,13 @@ export class ChatSession {
 }
 
 function toolDisplay(name: string, result: string): DisplayItem {
+	// Always role 'tool' (so the view can group/collapse tool activity); the
+	// isError flag drives red styling within the fold. Top-level errors keep
+	// role 'error' and stay visible.
 	return {
-		role: isToolError(result) ? 'error' : 'tool',
+		role: 'tool',
 		text: `${name}: ${firstLine(result)}`,
+		isError: isToolError(result),
 	};
 }
 

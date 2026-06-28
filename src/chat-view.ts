@@ -148,7 +148,25 @@ export class ChatView extends ItemView {
 	private render(): void {
 		if (!this.messagesEl) return;
 		this.messagesEl.empty();
-		for (const item of this.session.display) this.renderItem(item);
+
+		// Render messages, collapsing each run of tool activity into one fold.
+		const items = this.session.display;
+		let i = 0;
+		while (i < items.length) {
+			const item = items[i]!;
+			if (item.role === 'tool') {
+				const group: DisplayItem[] = [];
+				while (i < items.length && items[i]!.role === 'tool') {
+					group.push(items[i]!);
+					i++;
+				}
+				this.renderToolGroup(group);
+			} else {
+				this.renderItem(item);
+				i++;
+			}
+		}
+
 		if (this.session.busy) {
 			this.messagesEl.createDiv({
 				cls: 'lmstudio-notes-msg lmstudio-notes-thinking',
@@ -183,6 +201,33 @@ export class ChatView extends ItemView {
 
 		if (item.role === 'assistant' || item.role === 'user') {
 			this.renderActions(el, item);
+		}
+	}
+
+	/** Render a run of tool calls as a single fold, collapsed by default. */
+	private renderToolGroup(group: DisplayItem[]): void {
+		const details = this.messagesEl.createEl('details', { cls: 'lmstudio-notes-tools' });
+		if (group.some((g) => g.isError)) {
+			details.addClass('lmstudio-notes-tools-has-error');
+		}
+
+		const summary = details.createEl('summary', { cls: 'lmstudio-notes-tools-summary' });
+		setIcon(summary.createSpan({ cls: 'lmstudio-notes-tools-chevron' }), 'chevron-right');
+		const names = group
+			.map((g) => g.text.split(':')[0]?.trim())
+			.filter((n): n is string => Boolean(n));
+		const label = group.length === 1 ? '1 tool call' : `${group.length} tool calls`;
+		summary.createSpan({
+			text: names.length ? `${label}: ${names.join(', ')}` : label,
+		});
+
+		for (const g of group) {
+			details.createDiv({
+				cls: g.isError
+					? 'lmstudio-notes-tool-line lmstudio-notes-tool-error'
+					: 'lmstudio-notes-tool-line',
+				text: g.text,
+			});
 		}
 	}
 

@@ -1,7 +1,7 @@
 {
 	"id": "lmstudio-notes",
 	"name": "LM Studio Notes",
-	"version": "0.6.1",
+	"version": "0.6.2",
 	"minAppVersion": "1.7.2",
 	"description": "Read, summarize, and (soon) chat with your notes using a local model served by LM Studio. Fully local and privacy-first.",
 	"author": "Lorenzo Netti",

@@ -76,6 +76,7 @@ Open **Settings → LM Studio Notes**:
 - When the model wants to write to the vault, a confirmation dialog shows exactly what it will do — approve or cancel. Use **New chat** (the + button) to start a fresh conversation.
 - **Select and copy** any chat text, or use the hover **copy** button on a message to grab its raw markdown for pasting into a note.
 - **Edit & re-run**: hover a message you sent and click the **pencil** to edit it; saving re-runs the conversation from that point so you can fine-tune the prompt (Cmd/Ctrl+Enter to submit, Esc to cancel).
+- **Tool activity is folded**: the model's tool calls collapse into a single expandable row (closed by default) so the conversation stays readable — expand it to see exactly what it did.
 
 ## Semantic search (optional)
 
