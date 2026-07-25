@@ -13,7 +13,11 @@ const CONTEXT_MODES: Array<{ mode: NoteContextMode; icon: string; label: string 
 	{ mode: 'active', icon: 'file', label: 'Active note' },
 	{ mode: 'open', icon: 'files', label: 'All open notes' },
 	{ mode: 'linked', icon: 'link', label: 'Note + links' },
+	{ mode: 'relevant', icon: 'sparkles', label: 'Relevant notes' },
 ];
+
+/** How close to the bottom (px) counts as "following the stream" for autoscroll. */
+const AUTOSCROLL_SLACK = 80;
 
 /** The in-Obsidian chat pane that drives the local model and its tools. */
 export class ChatView extends ItemView {
@@ -25,13 +29,18 @@ export class ChatView extends ItemView {
 	private contextBtn!: HTMLButtonElement;
 	/** Turn index whose user message is currently being edited, if any. */
 	private editingTurn: number | null = null;
+	/** Text containers of currently-streaming items, for cheap token updates. */
+	private streamEls = new Map<DisplayItem, HTMLElement>();
 
 	constructor(
 		leaf: WorkspaceLeaf,
 		private readonly plugin: LMStudioNotesPlugin,
 	) {
 		super(leaf);
-		this.session = new ChatSession(plugin, () => this.render());
+		this.session = new ChatSession(plugin, {
+			onUpdate: () => this.render(),
+			onToken: (item) => this.renderToken(item),
+		});
 	}
 
 	getViewType(): string {
@@ -98,7 +107,10 @@ export class ChatView extends ItemView {
 				void this.submit();
 			}
 		});
-		this.registerDomEvent(this.sendBtn, 'click', () => void this.submit());
+		this.registerDomEvent(this.sendBtn, 'click', () => {
+			if (this.session.busy) this.session.stop();
+			else void this.submit();
+		});
 
 		this.render();
 	}
@@ -146,9 +158,31 @@ export class ChatView extends ItemView {
 		this.contextBtn.setAttribute('title', tip);
 	}
 
+	/**
+	 * Cheap per-token update: write the streamed text into the item's existing
+	 * element instead of rebuilding the whole transcript. Streamed markdown is
+	 * shown as plain text; the finalizing full render swaps in rendered
+	 * markdown.
+	 */
+	private renderToken(item: DisplayItem): void {
+		const el = this.streamEls.get(item);
+		if (!el) {
+			this.render();
+			return;
+		}
+		const follow =
+			this.messagesEl.scrollHeight -
+				this.messagesEl.scrollTop -
+				this.messagesEl.clientHeight <
+			AUTOSCROLL_SLACK;
+		el.setText(item.text);
+		if (follow) this.messagesEl.scrollTop = this.messagesEl.scrollHeight;
+	}
+
 	private render(): void {
 		if (!this.messagesEl) return;
 		this.messagesEl.empty();
+		this.streamEls.clear();
 
 		// Render messages, collapsing each run of tool activity into one fold.
 		const items = this.session.display;
@@ -165,28 +199,54 @@ export class ChatView extends ItemView {
 			} else if (item.role === 'context') {
 				this.renderContextFold(item);
 				i++;
+			} else if (item.role === 'reasoning') {
+				this.renderReasoning(item);
+				i++;
 			} else {
 				this.renderItem(item);
 				i++;
 			}
 		}
 
-		if (this.session.busy) {
+		if (this.session.busy && !this.hasStreamingItem(items)) {
 			this.messagesEl.createDiv({
 				cls: 'lmstudio-notes-msg lmstudio-notes-thinking',
 				text: 'Thinking…',
 			});
 		}
 		this.inputEl.disabled = this.session.busy;
-		this.sendBtn.disabled = this.session.busy;
 		this.newBtn.disabled = this.session.busy;
+		this.updateSendButton();
 		// Keep the latest message in view, but not while editing an earlier one.
 		if (this.editingTurn === null) {
 			this.messagesEl.scrollTop = this.messagesEl.scrollHeight;
 		}
 	}
 
+	private hasStreamingItem(items: DisplayItem[]): boolean {
+		return items.some((it) => it.streaming);
+	}
+
+	/** Send doubles as Stop while a generation is running. */
+	private updateSendButton(): void {
+		if (this.session.busy) {
+			this.sendBtn.setText('Stop');
+			this.sendBtn.removeClass('mod-cta');
+			this.sendBtn.addClass('mod-warning');
+		} else {
+			this.sendBtn.setText('Send');
+			this.sendBtn.removeClass('mod-warning');
+			this.sendBtn.addClass('mod-cta');
+		}
+		this.sendBtn.disabled = false;
+	}
+
 	private renderItem(item: DisplayItem): void {
+		if (item.role === 'notice') {
+			this.messagesEl.createDiv({ cls: 'lmstudio-notes-notice', text: item.text });
+			return;
+		}
+
 		const el = this.messagesEl.createDiv({
 			cls: `lmstudio-notes-msg lmstudio-notes-${item.role}`,
 		});
@@ -198,14 +258,37 @@ export class ChatView extends ItemView {
 
 		const content = el.createDiv({ cls: 'lmstudio-notes-msg-content' });
 		if (item.role === 'assistant') {
-			void MarkdownRenderer.render(this.app, item.text, content, '', this);
+			if (item.streaming) {
+				content.setText(item.text);
+				this.streamEls.set(item, content);
+			} else {
+				void MarkdownRenderer.render(this.app, item.text, content, '', this);
+			}
 		} else {
 			content.setText(item.text);
 		}
 
-		if (item.role === 'assistant' || item.role === 'user') {
+		if (item.stats) {
+			el.createDiv({ cls: 'lmstudio-notes-msg-stats', text: item.stats });
+		}
+
+		if ((item.role === 'assistant' && !item.streaming) || item.role === 'user') {
 			this.renderActions(el, item);
 		}
+	}
+
+	/** Render a model "thinking" block as a fold — open while streaming. */
+	private renderReasoning(item: DisplayItem): void {
+		const details = this.messagesEl.createEl('details', {
+			cls: 'lmstudio-notes-tools lmstudio-notes-reasoning',
+		});
+		if (item.streaming) details.open = true;
+		const summary = details.createEl('summary', { cls: 'lmstudio-notes-tools-summary' });
+		setIcon(summary.createSpan({ cls: 'lmstudio-notes-tools-chevron' }), 'chevron-right');
+		summary.createSpan({ text: item.streaming ? 'Thinking…' : 'Thoughts' });
+		const body = details.createDiv({ cls: 'lmstudio-notes-reasoning-body' });
+		body.setText(item.text);
+		if (item.streaming) this.streamEls.set(item, body);
 	}
 
 	/** Render the injected-context notes as a single fold, collapsed by default. */

@@ -183,6 +183,33 @@
 	color: var(--text-error);
 }
 
+/* Small inline notice, e.g. "Stopped." after aborting a generation. */
+.lmstudio-notes-notice {
+	align-self: center;
+	font-size: var(--font-ui-smaller);
+	color: var(--text-faint);
+	font-style: italic;
+}
+
+/* Reasoning ("thinking") fold for models that emit chain-of-thought. */
+.lmstudio-notes-reasoning-body {
+	margin-top: var(--size-2-2);
+	white-space: pre-wrap;
+	overflow-wrap: anywhere;
+	color: var(--text-faint);
+	font-style: italic;
+	max-height: 16em;
+	overflow-y: auto;
+}
+
+/* Generation stats shown under an assistant message (e.g. "42.0 tok/s"). */
+.lmstudio-notes-msg-stats {
+	margin-top: var(--size-2-2);
+	font-size: var(--font-ui-smaller);
+	color: var(--text-faint);
+	user-select: none;
+}
+
 .lmstudio-notes-thinking {
 	color: var(--text-muted);
 	font-style: italic;

@@ -9,6 +9,7 @@ import {
 } from './note-context';
 import { LMStudioNotesSettings } from './settings';
 import { lineDiff } from './diff';
+import { hybridRetrieve } from './retrieval';
 import type { ConfirmRequest } from './confirm-modal';
 
 /** How much note text a read tool returns at most, to protect the context window. */
@@ -158,12 +159,21 @@ export const ALL_TOOLS: Record<string, Tool> = {
 			type: 'function',
 			function: {
 				name: 'read_note',
-				description: 'Read the full content of a note by its vault path or name.',
+				description:
+					'Read the content of a note by its vault path or name. For long notes, pass "heading" to read just one section (see get_note_outline), or "offset" to continue reading where a truncated read stopped (use the returned nextOffset).',
 				parameters: objectSchema(
 					{
 						path: {
 							type: 'string',
 							description: 'Vault-relative path or note name, e.g. "Folder/Note.md" or "Note".',
+						},
+						heading: {
+							type: 'string',
+							description: 'Optional heading whose section to read (exact text, case-insensitive).',
+						},
+						offset: {
+							type: 'number',
+							description: 'Optional character offset to start reading from (default 0).',
 						},
 					},
 					['path'],
@@ -176,60 +186,89 @@ export const ALL_TOOLS: Record<string, Tool> = {
 			const file = resolveFile(app, path);
 			if (!file) return `Note not found: ${path}`;
 			const content = await app.vault.cachedRead(file);
-			return JSON.stringify({ path: file.path, content: clampContent(content) });
+
+			let body = content;
+			const heading = str(args, 'heading');
+			if (heading) {
+				const headings = app.metadataCache.getFileCache(file)?.headings ?? [];
+				const idx = headings.findIndex(
+					(h) => h.heading.toLowerCase() === heading.toLowerCase(),
+				);
+				if (idx === -1) {
+					return JSON.stringify({
+						path: file.path,
+						error: `Heading not found: "${heading}"`,
+						headings: headings.map((h) => h.heading),
+					});
+				}
+				const start = headings[idx]!.position.start.offset;
+				let end = content.length;
+				for (let j = idx + 1; j < headings.length; j++) {
+					if (headings[j]!.level <= headings[idx]!.level) {
+						end = headings[j]!.position.start.offset;
+						break;
+					}
+				}
+				body = content.slice(start, end);
+			}
+
+			const offset = clampInt(num(args, 'offset') ?? 0, 0, Math.max(0, body.length));
+			const slice = body.slice(offset, offset + TOOL_MAX_CHARS);
+			const truncated = offset + slice.length < body.length;
+			return JSON.stringify({
+				path: file.path,
+				...(heading ? { heading } : {}),
+				length: body.length,
+				...(offset > 0 ? { offset } : {}),
+				truncated,
+				...(truncated ? { nextOffset: offset + slice.length } : {}),
+				content: slice,
+			});
 		},
 	},
 
-	search_vault: {
+	search_notes: {
 		write: false,
 		def: {
 			type: 'function',
 			function: {
-				name: 'search_vault',
+				name: 'search_notes',
 				description:
-					'Search the vault for notes whose path or content contains the query (case-insensitive). Returns matching paths with a short snippet.',
+					'Search the vault for notes matching a query. Combines exact keyword matching with semantic (meaning-based) search over the local embedding index, ranked together. Works for exact words AND descriptions of a topic. Returns the best-matching excerpt per note; use read_note for full content. Use short, specific queries.',
 				parameters: objectSchema(
 					{
-						query: { type: 'string', description: 'Text to search for.' },
-						limit: { type: 'number', description: 'Max results (default 10, max 50).' },
+						query: { type: 'string', description: 'What to search for (keywords or a topic).' },
+						folder: {
+							type: 'string',
+							description: 'Optional folder path to search within, e.g. "Journal/Weekly".',
+						},
+						limit: { type: 'number', description: 'Max results (default 8, max 30).' },
 					},
 					['query'],
 				),
 			},
 		},
-		run: async ({ app }, args) => {
+		run: async ({ plugin }, args) => {
 			const query = str(args, 'query');
 			if (!query) return 'Error: missing "query".';
-			const limit = Math.max(1, Math.min(50, num(args, 'limit') ?? 10));
-			const q = query.toLowerCase();
-			const results: Array<{ path: string; snippet: string }> = [];
-			// Cap how many files we read from disk so a no-match query on a huge
-			// vault can't stall the chat.
-			const MAX_SCAN = 1000;
-			let scanned = 0;
-			let capped = false;
-
-			for (const file of app.vault.getMarkdownFiles()) {
-				if (results.length >= limit) break;
-				if (file.path.toLowerCase().includes(q)) {
-					results.push({ path: file.path, snippet: '(matched path)' });
-					continue;
-				}
-				if (scanned >= MAX_SCAN) {
-					capped = true;
-					break;
-				}
-				scanned++;
-				const content = await app.vault.cachedRead(file);
-				const idx = content.toLowerCase().indexOf(q);
-				if (idx === -1) continue;
-				const snippet = content
-					.slice(Math.max(0, idx - 60), idx + q.length + 60)
-					.replace(/\s+/g, ' ')
-					.trim();
-				results.push({ path: file.path, snippet });
-			}
-			return JSON.stringify({ query, count: results.length, capped, results });
+			const limit = clampInt(num(args, 'limit') ?? 8, 1, 30);
+			const folder = str(args, 'folder');
+			const { notes, semanticUsed } = await hybridRetrieve(plugin, query, {
+				limit,
+				folder,
+			});
+			return JSON.stringify({
+				query,
+				...(folder ? { folder } : {}),
+				semantic: semanticUsed,
+				count: notes.length,
+				results: notes.map((n) => ({
+					path: n.path,
+					via: n.via,
+					...(n.heading ? { heading: n.heading } : {}),
+					excerpt: n.excerpt.slice(0, 400),
+				})),
+			});
 		},
 	},
 
@@ -239,19 +278,44 @@ export const ALL_TOOLS: Record<string, Tool> = {
 			type: 'function',
 			function: {
 				name: 'list_vault_notes',
-				description: 'List markdown note paths in the vault.',
+				description:
+					'List markdown note paths in the vault, optionally within a folder, sorted by name or by last modified (newest first).',
 				parameters: objectSchema({
+					folder: {
+						type: 'string',
+						description: 'Optional folder path to list, e.g. "Projects". Omit for the whole vault.',
+					},
+					sort: {
+						type: 'string',
+						enum: ['name', 'modified'],
+						description: 'Sort order (default "name"; "modified" = newest first).',
+					},
 					limit: { type: 'number', description: 'Max paths to return (default 100, max 500).' },
 				}),
 			},
 		},
 		run: async ({ app }, args) => {
-			const limit = Math.max(1, Math.min(500, num(args, 'limit') ?? 100));
-			const paths = app.vault
-				.getMarkdownFiles()
-				.slice(0, limit)
-				.map((f) => f.path);
-			return JSON.stringify({ count: paths.length, paths });
+			const limit = clampInt(num(args, 'limit') ?? 100, 1, 500);
+			const folder = str(args, 'folder');
+			const prefix = folder ? `${normalizePath(folder).replace(/\/+$/, '')}/` : null;
+			const sort = str(args, 'sort') === 'modified' ? 'modified' : 'name';
+
+			let files = app.vault.getMarkdownFiles();
+			if (prefix) files = files.filter((f) => f.path.startsWith(prefix));
+			const total = files.length;
+			files = files
+				.slice()
+				.sort((a, b) =>
+					sort === 'modified' ? b.stat.mtime - a.stat.mtime : a.path.localeCompare(b.path),
+				);
+			const paths = files.slice(0, limit).map((f) => f.path);
+			return JSON.stringify({
+				total,
+				count: paths.length,
+				...(folder ? { folder } : {}),
+				sort,
+				paths,
+			});
 		},
 	},
 
@@ -461,40 +525,6 @@ export const ALL_TOOLS: Record<string, Tool> = {
 				.slice(0, limit)
 				.map((f) => ({ path: f.path, modified: new Date(f.stat.mtime).toISOString() }));
 			return JSON.stringify({ count: notes.length, notes });
-		},
-	},
-
-	semantic_search: {
-		write: false,
-		enabled: (settings) => Boolean(settings.embeddingModel),
-		def: {
-			type: 'function',
-			function: {
-				name: 'semantic_search',
-				description:
-					'Find notes by MEANING (not keywords) using the local embedding index. Use this when the user describes a topic/idea rather than exact words. Returns best-matching notes with snippets.',
-				parameters: objectSchema(
-					{
-						query: { type: 'string', description: 'What to search for.' },
-						limit: { type: 'number', description: 'Max results (default 5, max 20).' },
-					},
-					['query'],
-				),
-			},
-		},
-		run: async ({ plugin }, args) => {
-			const query = str(args, 'query');
-			if (!query) return 'Error: missing "query".';
-			const limit = clampInt(num(args, 'limit') ?? 5, 1, 20);
-			if (!(await plugin.semanticIndex.isBuilt())) {
-				return 'The semantic index is empty. Ask the user to build it in settings (Semantic search → Build), or use search_vault instead.';
-			}
-			try {
-				const results = await plugin.semanticIndex.search(query, limit);
-				return JSON.stringify({ query, results });
-			} catch (e) {
-				return `Error: ${(e as Error).message}`;
-			}
 		},
 	},
 
@@ -750,6 +780,75 @@ export const ALL_TOOLS: Record<string, Tool> = {
 			};
 		},
 	},
+
+	move_note: {
+		write: true,
+		def: {
+			type: 'function',
+			function: {
+				name: 'move_note',
+				description:
+					'Move or rename a note to a new vault path. Links pointing at the note are updated automatically. Folders in the new path are created if needed.',
+				parameters: objectSchema(
+					{
+						path: { type: 'string', description: 'Exact current vault path of the note.' },
+						new_path: {
+							type: 'string',
+							description: 'New vault path (".md" added if missing), e.g. "Archive/Old note.md".',
+						},
+					},
+					['path', 'new_path'],
+				),
+			},
+		},
+		describe: (args) => `Move "${str(args, 'path')}" to "${str(args, 'new_path')}".`,
+		run: async ({ app }, args) => {
+			const path = str(args, 'path');
+			const newPathRaw = str(args, 'new_path');
+			if (!path || !newPathRaw) return 'Error: missing "path" or "new_path".';
+			const file = resolveFileStrict(app, path);
+			if (!file) {
+				return `No note at exact path "${path}". Provide the full vault path, e.g. "Folder/Note.md".`;
+			}
+			const newPath = normalizePath(ensureMd(newPathRaw));
+			if (app.vault.getAbstractFileByPath(newPath)) {
+				return `A file already exists at ${newPath}.`;
+			}
+			const folder = newPath.split('/').slice(0, -1).join('/');
+			if (folder && !app.vault.getAbstractFileByPath(folder)) {
+				await app.vault.createFolder(folder);
+			}
+			await app.fileManager.renameFile(file, newPath);
+			return `Moved "${path}" to "${newPath}" (links updated).`;
+		},
+	},
+
+	delete_note: {
+		write: true,
+		def: {
+			type: 'function',
+			function: {
+				name: 'delete_note',
+				description:
+					'Move a note to the trash (recoverable — NOT a permanent delete). Requires the exact vault path.',
+				parameters: objectSchema(
+					{ path: { type: 'string', description: 'Exact vault path of the note to trash.' } },
+					['path'],
+				),
+			},
+		},
+		describe: (args) => `Move "${str(args, 'path')}" to the trash.`,
+		run: async ({ app }, args) => {
+			const path = str(args, 'path');
+			if (!path) return 'Error: missing "path".';
+			const file = resolveFileStrict(app, path);
+			if (!file) {
+				return `No note at exact path "${path}". Provide the full vault path, e.g. "Folder/Note.md".`;
+			}
+			await app.fileManager.trashFile(file);
+			return `Moved "${file.path}" to the trash.`;
+		},
+	},
 };
 
 export type ToolGroup = 'Reading' | 'Search' | 'Graph' | 'Editing';
@@ -761,8 +860,7 @@ const TOOL_GROUP_MAP: Record<string, ToolGroup> = {
 	read_note: 'Reading',
 	list_vault_notes: 'Reading',
 	get_recent_notes: 'Reading',
-	search_vault: 'Search',
-	semantic_search: 'Search',
+	search_notes: 'Search',
 	get_note_links: 'Graph',
 	find_related_notes: 'Graph',
 	get_note_outline: 'Graph',
@@ -774,6 +872,8 @@ const TOOL_GROUP_MAP: Record<string, ToolGroup> = {
 	update_frontmatter: 'Editing',
 	create_note: 'Editing',
 	replace_in_note: 'Editing',
+	move_note: 'Editing',
+	delete_note: 'Editing',
 };
 
 export const ALL_TOOL_NAMES = Object.keys(ALL_TOOLS);

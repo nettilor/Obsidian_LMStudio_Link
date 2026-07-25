@@ -6,7 +6,21 @@ import { toolCatalog } from './tools';
 import { openToolsMenu } from './tool-menu';
 
 /** Which note content is auto-injected into chat context. */
-export type NoteContextMode = 'none' | 'active' | 'open' | 'linked';
+export type NoteContextMode = 'none' | 'active' | 'open' | 'linked' | 'relevant';
+
+/**
+ * How much of the model's context window the plugin may fill with note
+ * content and chat history. Scale factors are applied to the base character
+ * budgets in chat-session.ts.
+ */
+export type ContextSize = 'compact' | 'standard' | 'large' | 'max';
+
+export const CONTEXT_SIZES: Array<{ value: ContextSize; label: string }> = [
+	{ value: 'compact', label: 'Compact (~4k-token models)' },
+	{ value: 'standard', label: 'Standard (~8k)' },
+	{ value: 'large', label: 'Large (~16k)' },
+	{ value: 'max', label: 'Max (~32k+)' },
+];
 
 export interface LMStudioNotesSettings {
 	/** OpenAI-compatible base URL. `/v1` is appended automatically if omitted. */
@@ -17,6 +31,12 @@ export interface LMStudioNotesSettings {
 	model: string;
 	/** Sampling temperature for generations. */
 	temperature: number;
+	/** Scale factor preset for context/history budgets (match the model's window). */
+	contextSize: ContextSize;
+	/** Max tool round-trips per user turn before forcing a final answer. */
+	maxToolIterations: number;
+	/** Cap on generated tokens per completion. 0 = no cap (server default). */
+	maxOutputTokens: number;
 	/** System prompt used by the summarize commands. */
 	summarySystemPrompt: string;
 	/** Where a generated summary is placed in the note. */
@@ -35,6 +55,8 @@ export interface LMStudioNotesSettings {
 	linkedMaxNotes: number;
 	/** "Current note + links" mode: also follow links 2 hops out. */
 	linkedTwoHop: boolean;
+	/** "Relevant notes" mode: max retrieved note excerpts to inject per message. */
+	retrievedMaxNotes: number;
 	/** Names of tools the model is not allowed to use. */
 	disabledTools: string[];
 	/** Ask for confirmation before any tool writes to the vault. */
@@ -55,16 +77,20 @@ export const DEFAULT_SUMMARY_PROMPT =
 
 export const DEFAULT_CHAT_PROMPT =
 	"You are a helpful assistant embedded in the user's Obsidian vault, powered by " +
-	'a local model. You can read the user\'s notes and, when asked, edit them using ' +
-	'the provided tools. Prefer calling tools to fetch real note content over ' +
-	'guessing. When editing, make minimal, faithful changes and briefly explain what ' +
-	'you did. Respond in Markdown.';
+	"a local model. You can read, search, and (when asked) edit the user's notes " +
+	'using the provided tools. Prefer tools over guessing: search before answering ' +
+	'questions about the vault, and read a note before editing it. Work step by ' +
+	'step — one tool call at a time when unsure. When editing, make minimal, ' +
+	'faithful changes and briefly explain what you did. Respond in Markdown.';
 
 export const DEFAULT_SETTINGS: LMStudioNotesSettings = {
 	baseUrl: 'http://localhost:1234/v1',
 	apiKey: 'lm-studio',
 	model: '',
 	temperature: 0.3,
+	contextSize: 'standard',
+	maxToolIterations: 10,
+	maxOutputTokens: 0,
 	summarySystemPrompt: DEFAULT_SUMMARY_PROMPT,
 	summaryInsertLocation: 'top',
 	summaryAsCallout: true,
@@ -74,6 +100,7 @@ export const DEFAULT_SETTINGS: LMStudioNotesSettings = {
 	noteContext: 'active',
 	linkedMaxNotes: 8,
 	linkedTwoHop: false,
+	retrievedMaxNotes: 6,
 	disabledTools: [],
 	requireWriteConfirmation: true,
 	embeddingModel: '',
@@ -230,6 +257,65 @@ export class LMStudioNotesSettingTab extends PluginSettingTab {
 					}),
 			);
 
+		new Setting(containerEl).setName('Performance').setHeading();
+
+		new Setting(containerEl)
+			.setName('Context size')
+			.setDesc(
+				'How much note content and chat history to send per request. Match ' +
+					"this to the context length configured for your model in LM Studio — " +
+					'larger sizes give the model more to work with but slow down prompt ' +
+					'processing on long conversations.',
+			)
+			.addDropdown((dropdown) => {
+				for (const { value, label } of CONTEXT_SIZES) {
+					dropdown.addOption(value, label);
+				}
+				dropdown
+					.setValue(this.plugin.settings.contextSize)
+					.onChange(async (value) => {
+						this.plugin.settings.contextSize = value as ContextSize;
+						await this.plugin.saveSettings();
+					});
+			});
+
+		new Setting(containerEl)
+			.setName('Max tool steps per message')
+			.setDesc(
+				'How many tool round-trips the model may take for one message before ' +
+					'being forced to answer. Raise this for multi-note tasks.',
+			)
+			.addSlider((slider) =>
+				slider
+					.setLimits(2, 24, 1)
+					.setValue(this.plugin.settings.maxToolIterations)
+					.setDynamicTooltip()
+					.onChange(async (value) => {
+						this.plugin.settings.maxToolIterations = value;
+						await this.plugin.saveSettings();
+					}),
+			);
+
+		new Setting(containerEl)
+			.setName('Max response tokens')
+			.setDesc(
+				'Cap on tokens generated per response. 0 = no cap. A cap keeps a ' +
+					'rambling model from running for minutes; note that reasoning ' +
+					'("thinking") tokens count toward it.',
+			)
+			.addText((text) => {
+				text.inputEl.type = 'number';
+				text
+					.setPlaceholder('0')
+					.setValue(String(this.plugin.settings.maxOutputTokens || 0))
+					.onChange(async (value) => {
+						const n = Number(value);
+						this.plugin.settings.maxOutputTokens =
+							Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
+						await this.plugin.saveSettings();
+					});
+			});
+
 		new Setting(containerEl).setName('Summarize').setHeading();
 
 		new Setting(containerEl)
@@ -295,7 +381,10 @@ export class LMStudioNotesSettingTab extends PluginSettingTab {
 			.setDesc(
 				'Which note content to automatically include so the model knows what ' +
 					'you are working on. "All open notes" sends every open tab; ' +
-					'"Current note + links" adds the note\'s linked and tag-related notes.',
+					'"Current note + links" adds the note\'s linked and tag-related notes; ' +
+					'"Relevant notes" retrieves the vault content most relevant to each ' +
+					'message you send (keyword + semantic search) — the best choice for ' +
+					'questions across the whole vault, especially with smaller models.',
 			)
 			.addDropdown((dropdown) =>
 				dropdown
@@ -303,6 +392,7 @@ export class LMStudioNotesSettingTab extends PluginSettingTab {
 					.addOption('active', 'Active note')
 					.addOption('open', 'All open notes')
 					.addOption('linked', 'Current note + links')
+					.addOption('relevant', 'Relevant notes (auto-retrieval)')
 					.setValue(this.plugin.settings.noteContext)
 					.onChange(async (value) => {
 						this.plugin.settings.noteContext = value as NoteContextMode;
@@ -324,6 +414,23 @@ export class LMStudioNotesSettingTab extends PluginSettingTab {
 					.setDynamicTooltip()
 					.onChange(async (value) => {
 						this.plugin.settings.linkedMaxNotes = value;
+						await this.plugin.saveSettings();
+					}),
+			);
+
+		new Setting(containerEl)
+			.setName('Relevant context: max retrieved notes')
+			.setDesc(
+				'For "Relevant notes": how many retrieved note excerpts to include ' +
+					'with each message.',
+			)
+			.addSlider((slider) =>
+				slider
+					.setLimits(1, 15, 1)
+					.setValue(this.plugin.settings.retrievedMaxNotes)
+					.setDynamicTooltip()
+					.onChange(async (value) => {
+						this.plugin.settings.retrievedMaxNotes = value;
 						await this.plugin.saveSettings();
 					}),
 			);

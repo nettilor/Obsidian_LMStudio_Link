@@ -10,12 +10,22 @@ import { ChatView, VIEW_TYPE_CHAT } from './chat-view';
 import { SemanticIndex } from './semantic-index';
 import { EDITING_TOOL_NAMES } from './tools';
 
+/** How often to re-check the semantic index against the vault (30 min). */
+const RECONCILE_INTERVAL_MS = 30 * 60 * 1000;
+
 export default class LMStudioNotesPlugin extends Plugin {
 	settings!: LMStudioNotesSettings;
 	client!: LMStudioClient;
 	semanticIndex!: SemanticIndex;
 	/** Guards against overlapping generations (commands + ribbon + hotkeys). */
 	summarizing = false;
+	/**
+	 * Count of chat/summarize generations currently in flight. Background
+	 * embedding work checks this and defers: on LM Studio setups that evict
+	 * models to make room (JIT auto-evict), an embedding request landing
+	 * mid-generation can unload the chat model and fail the chat with HTTP 400.
+	 */
+	activeGenerations = 0;
 
 	async onload() {
 		await this.loadSettings();
@@ -28,6 +38,19 @@ export default class LMStudioNotesPlugin extends Plugin {
 
 		this.semanticIndex = new SemanticIndex(this);
 		this.registerSemanticIndexEvents();
+
+		// Catch up on changes made while Obsidian was closed, synced in from
+		// another device, or skipped because LM Studio wasn't running at the
+		// time: reconcile once the workspace is ready, then periodically. When
+		// LM Studio is offline the sweep queues the stale files and retries on
+		// a later tick — cheap enough to run unconditionally.
+		this.app.workspace.onLayoutReady(() => void this.semanticIndex.reconcile());
+		this.registerInterval(
+			window.setInterval(
+				() => void this.semanticIndex.reconcile(),
+				RECONCILE_INTERVAL_MS,
+			),
+		);
 
 		this.registerView(VIEW_TYPE_CHAT, (leaf) => new ChatView(leaf, this));
 
@@ -118,8 +141,42 @@ export default class LMStudioNotesPlugin extends Plugin {
 		delete (this.settings as { linkedMaxTagged?: number }).linkedMaxTagged;
 
 		// Coerce out-of-range persisted values back to defaults.
-		if (!['none', 'active', 'open', 'linked'].includes(this.settings.noteContext)) {
+		if (
+			!['none', 'active', 'open', 'linked', 'relevant'].includes(this.settings.noteContext)
+		) {
 			this.settings.noteContext = DEFAULT_SETTINGS.noteContext;
+		}
+		if (
+			typeof this.settings.retrievedMaxNotes !== 'number' ||
+			!Number.isFinite(this.settings.retrievedMaxNotes)
+		) {
+			this.settings.retrievedMaxNotes = DEFAULT_SETTINGS.retrievedMaxNotes;
+		} else {
+			this.settings.retrievedMaxNotes = Math.min(
+				15,
+				Math.max(1, Math.round(this.settings.retrievedMaxNotes)),
+			);
+		}
+		if (!['compact', 'standard', 'large', 'max'].includes(this.settings.contextSize)) {
+			this.settings.contextSize = DEFAULT_SETTINGS.contextSize;
+		}
+		if (
+			typeof this.settings.maxToolIterations !== 'number' ||
+			!Number.isFinite(this.settings.maxToolIterations)
+		) {
+			this.settings.maxToolIterations = DEFAULT_SETTINGS.maxToolIterations;
+		} else {
+			this.settings.maxToolIterations = Math.min(
+				24,
+				Math.max(2, Math.round(this.settings.maxToolIterations)),
+			);
+		}
+		if (
+			typeof this.settings.maxOutputTokens !== 'number' ||
+			!Number.isFinite(this.settings.maxOutputTokens) ||
+			this.settings.maxOutputTokens < 0
+		) {
+			this.settings.maxOutputTokens = DEFAULT_SETTINGS.maxOutputTokens;
 		}
 		if (!Array.isArray(this.settings.disabledTools)) {
 			this.settings.disabledTools = [];

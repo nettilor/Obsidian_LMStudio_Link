@@ -25,6 +25,7 @@ export async function summarizeActiveNote(
 		return;
 	}
 	plugin.summarizing = true;
+	plugin.activeGenerations++;
 
 	const { settings, client, app } = plugin;
 	let progress: Notice | null = null;
@@ -68,7 +69,11 @@ export async function summarizeActiveNote(
 						`\n\n---\n${text}`,
 				},
 			],
-			{ model: settings.model, temperature: settings.temperature },
+			{
+				model: settings.model,
+				temperature: settings.temperature,
+				maxTokens: settings.maxOutputTokens > 0 ? settings.maxOutputTokens : undefined,
+			},
 		);
 
 		const summary = content.trim();
@@ -88,6 +93,7 @@ export async function summarizeActiveNote(
 	} finally {
 		progress?.hide();
 		plugin.summarizing = false;
+		plugin.activeGenerations--;
 	}
 }
 

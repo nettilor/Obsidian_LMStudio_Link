@@ -1,10 +1,12 @@
 import { App, getAllTags, MarkdownView, TFile } from 'obsidian';
 import type LMStudioNotesPlugin from './main';
-import { describeError, WireMessage } from './lmstudio';
+import { describeError, StreamResult, ToolDef, WireMessage } from './lmstudio';
 import { getActiveNote } from './note-context';
 import { confirmEdit } from './confirm-modal';
 import { executeTool, ToolContext, toolDefsFor } from './tools';
 import { hasToolCallMarkers, recoverToolCalls } from './tool-call-recovery';
+import { hybridRetrieve, RetrievedNote } from './retrieval';
+import { ContextSize, LMStudioNotesSettings } from './settings';
 
 const TOOL_PARSE_HELP =
 	'The model emitted a tool call the local server could not parse (common with ' +
@@ -12,24 +14,55 @@ const TOOL_PARSE_HELP =
 	'fewer tools (the wrench menu), updating LM Studio, or using a model with native ' +
 	'tool-call support.';
 
-/** Safety cap on how many tool round-trips a single user turn may trigger. */
-const MAX_TOOL_ITERATIONS = 6;
-/** How much active-note text to inject as context, when that option is on. */
-const CONTEXT_MAX_CHARS = 16_000;
-/** Total budget across all open notes when "All open notes" context is on. */
-const OPEN_NOTES_MAX_CHARS = 24_000;
-/** Budgets for "Current note + links" mode. */
-const LINKED_CONTEXT_MAX_CHARS = 24_000;
-const LINKED_ACTIVE_MAX_CHARS = 12_000;
-const LINKED_PER_NOTE_MAX_CHARS = 5_000;
 /** How long to reuse the vault-wide backlink/tag indexes (ms) before rebuilding. */
 const GRAPH_CACHE_TTL = 10_000;
 /** Relevance bonus for a directly-linked note, in "shared-tag IDF" units. */
 const LINK_WEIGHT = 2;
-/** Soft budget for retained conversation history, to avoid context blowups. */
-const MAX_HISTORY_CHARS = 16_000;
 
-export type DisplayRole = 'user' | 'assistant' | 'tool' | 'error' | 'context';
+/**
+ * Character budgets at the "standard" context size (~8k-token models); the
+ * user's context-size setting scales all of them together.
+ */
+const CONTEXT_SCALE: Record<ContextSize, number> = {
+	compact: 0.5,
+	standard: 1,
+	large: 2,
+	max: 4,
+};
+
+interface Budgets {
+	/** Active-note text injected as context. */
+	activeNote: number;
+	/** Total across all open notes ("All open notes" mode). */
+	openNotes: number;
+	/** Totals for "Current note + links" mode. */
+	linkedTotal: number;
+	linkedActive: number;
+	linkedPerNote: number;
+	/** Retained conversation history. */
+	history: number;
+}
+
+function budgetsFor(settings: LMStudioNotesSettings): Budgets {
+	const k = CONTEXT_SCALE[settings.contextSize] ?? 1;
+	return {
+		activeNote: 16_000 * k,
+		openNotes: 24_000 * k,
+		linkedTotal: 24_000 * k,
+		linkedActive: 12_000 * k,
+		linkedPerNote: 5_000 * k,
+		history: 16_000 * k,
+	};
+}
+
+export type DisplayRole =
+	| 'user'
+	| 'assistant'
+	| 'reasoning'
+	| 'tool'
+	| 'error'
+	| 'notice'
+	| 'context';
 
 export interface DisplayItem {
 	role: DisplayRole;
@@ -40,6 +73,18 @@ export interface DisplayItem {
 	isError?: boolean;
 	/** For 'context' items: the note paths/labels injected as context this turn. */
 	sources?: string[];
+	/** True while this item is receiving streamed tokens. */
+	streaming?: boolean;
+	/** Generation stats to show after the message, e.g. "42 tok/s". */
+	stats?: string;
+}
+
+/** Callbacks the chat view wires up to react to session changes. */
+export interface ChatSessionEvents {
+	/** Structural change (item added/removed/finalized) — re-render everything. */
+	onUpdate(): void;
+	/** Streamed text changed on one item — update just that element. */
+	onToken(item: DisplayItem): void;
 }
 
 /** A note-context system message plus the list of notes it injected. */
@@ -63,12 +108,13 @@ interface Turn {
 export class ChatSession {
 	busy = false;
 	private turns: Turn[] = [];
+	private abortCtl: AbortController | null = null;
 	private backlinkCache: { map: Map<string, string[]>; at: number } | null = null;
 	private tagCache: { map: Map<string, string[]>; at: number } | null = null;
 
 	constructor(
 		private readonly plugin: LMStudioNotesPlugin,
-		private readonly onUpdate: () => void,
+		private readonly events: ChatSessionEvents,
 	) {}
 
 	/** Flattened view of every turn's display items, tagging user-message turns. */
@@ -84,7 +130,12 @@ export class ChatSession {
 
 	reset(): void {
 		this.turns = [];
-		this.onUpdate();
+		this.events.onUpdate();
+	}
+
+	/** Abort the in-flight generation; the partial answer is kept. */
+	stop(): void {
+		this.abortCtl?.abort();
 	}
 
 	/** Replace turn `turnIndex` with new text and regenerate from there. */
@@ -100,7 +151,7 @@ export class ChatSession {
 		const trimmed = text.trim();
 		if (!trimmed || this.busy) return;
 
-		const { settings, client, app } = this.plugin;
+		const { settings, app } = this.plugin;
 		if (!settings.model) {
 			this.turns.push({
 				userText: trimmed,
@@ -110,18 +161,21 @@ export class ChatSession {
 					{ role: 'error', text: 'No model selected. Choose one in the plugin settings.' },
 				],
 			});
-			this.onUpdate();
+			this.events.onUpdate();
 			return;
 		}
 
 		this.busy = true;
+		this.plugin.activeGenerations++;
+		this.abortCtl = new AbortController();
+		const signal = this.abortCtl.signal;
 		const turn: Turn = {
 			userText: trimmed,
 			wire: [{ role: 'user', content: trimmed }],
 			display: [{ role: 'user', text: trimmed }],
 		};
 		this.turns.push(turn);
-		this.onUpdate();
+		this.events.onUpdate();
 
 		try {
 			// Context (vault facts, date, note content) — computed once, prepended fresh.
@@ -130,11 +184,11 @@ export class ChatSession {
 			if (guide) systemExtras.push(guide);
 			const dateMsg = this.dateContextMessage();
 			if (dateMsg) systemExtras.push(dateMsg);
-			const noteCtx = await this.notesContext();
+			const noteCtx = await this.notesContext(trimmed);
 			const context = noteCtx?.message ?? null;
 			if (noteCtx && noteCtx.sources.length > 0) {
 				turn.display.push({ role: 'context', text: '', sources: noteCtx.sources });
-				this.onUpdate();
+				this.events.onUpdate();
 			}
 			const tools = toolDefsFor(settings);
 			const ctx: ToolContext = { app, plugin: this.plugin };
@@ -149,16 +203,21 @@ export class ChatSession {
 				return msgs;
 			};
 
+			const maxIterations = Math.max(1, settings.maxToolIterations);
 			let answered = false;
-			for (let i = 0; i < MAX_TOOL_ITERATIONS && !answered; i++) {
-				const { message } = await client.complete(buildOutgoing(), {
-					model: settings.model,
-					temperature: settings.temperature,
-					tools,
-				});
-				let calls = message.tool_calls ?? [];
-				let content = message.content;
+			for (let i = 0; i < maxIterations && !answered && !signal.aborted; i++) {
+				const res = await this.streamCompletion(turn, buildOutgoing(), tools, signal);
+				let calls = res.message.tool_calls ?? [];
+				let content = res.message.content;
 				let brokenToolCall = false;
+
+				if (res.aborted) {
+					// Keep the partial text; never execute tool calls from a cut stream.
+					turn.wire.push({ role: 'assistant', content: content ?? '' });
+					this.markStopped(turn, res);
+					answered = true;
+					break;
+				}
 
 				// Recover tool calls the server leaked into text (gpt-oss/harmony).
 				if (calls.length === 0 && content && hasToolCallMarkers(content)) {
@@ -166,6 +225,7 @@ export class ChatSession {
 					if (recovered.length > 0) {
 						calls = recovered;
 						content = null; // the text WAS the tool call; don't show it
+						if (res.textItem) removeItem(turn.display, res.textItem);
 					} else {
 						brokenToolCall = true;
 					}
@@ -181,24 +241,31 @@ export class ChatSession {
 
 				if (calls.length === 0) {
 					if (brokenToolCall) {
+						if (res.textItem) removeItem(turn.display, res.textItem);
 						turn.display.push({ role: 'error', text: TOOL_PARSE_HELP });
-					} else {
-						const final = (content ?? '').trim();
-						turn.display.push({ role: 'assistant', text: final || '(no response)' });
+					} else if (!res.textItem) {
+						turn.display.push({ role: 'assistant', text: '(no response)' });
+					} else if (!res.textItem.text.trim()) {
+						res.textItem.text = '(no response)';
 					}
-					this.onUpdate();
+					this.events.onUpdate();
 					answered = true;
 					break;
 				}
 
-				if (content && content.trim()) {
-					turn.display.push({ role: 'assistant', text: content });
-					this.onUpdate();
-				}
-
 				for (const call of calls) {
+					// A stop mid-tool-run still needs a result per call to keep the
+					// wire history valid for later turns.
+					if (signal.aborted) {
+						turn.wire.push({
+							role: 'tool',
+							content: 'Cancelled by the user.',
+							tool_call_id: call.id,
+						});
+						continue;
+					}
 					turn.display.push({ role: 'tool', text: `Running ${call.function.name}…` });
-					this.onUpdate();
+					this.events.onUpdate();
 
 					const result = await executeTool(ctx, call, {
 						confirm: (req) => confirmEdit(app, req),
@@ -209,23 +276,30 @@ export class ChatSession {
 						call.function.name,
 						result,
 					);
-					this.onUpdate();
+					this.events.onUpdate();
+				}
+
+				if (signal.aborted) {
+					this.markStopped(turn, null);
+					answered = true;
+					break;
 				}
 			}
 
-			if (!answered) {
+			if (!answered && !signal.aborted) {
 				// Hit the tool cap. Force one final text answer (no tools).
-				const { message } = await client.complete(buildOutgoing(), {
-					model: settings.model,
-					temperature: settings.temperature,
-				});
-				turn.wire.push({ role: 'assistant', content: message.content ?? '' });
-				const final = (message.content ?? '').trim();
-				turn.display.push({
-					role: 'assistant',
-					text: final || 'Stopped after several tool calls — try splitting the task up.',
-				});
+				const res = await this.streamCompletion(turn, buildOutgoing(), undefined, signal);
+				turn.wire.push({ role: 'assistant', content: res.message.content ?? '' });
+				if (res.aborted) {
+					this.markStopped(turn, res);
+				} else if (!res.textItem) {
+					turn.display.push({
+						role: 'assistant',
+						text: 'Stopped after several tool calls — try splitting the task up.',
+					});
+				}
 			}
+
 		} catch (e) {
 			// Keep only the self-contained user message: drops any partial
 			// assistant/tool wire (no dangling tool_calls) while still leaving the
@@ -234,8 +308,87 @@ export class ChatSession {
 			turn.display.push({ role: 'error', text: describeError(e) });
 		} finally {
 			this.busy = false;
-			this.onUpdate();
+			this.plugin.activeGenerations--;
+			this.abortCtl = null;
+			this.events.onUpdate();
+			// The server is idle again — a good moment to catch the semantic index
+			// up on files created/edited during this turn (or while LM Studio was
+			// off). Runs after the counter drops so it isn't deferred by it.
+			void this.plugin.semanticIndex.reconcile();
 		}
+	}
+
+	/**
+	 * Run one streamed completion, materializing reasoning/answer display items
+	 * as their first tokens arrive and finalizing them when the stream ends.
+	 */
+	private async streamCompletion(
+		turn: Turn,
+		outgoing: WireMessage[],
+		tools: ToolDef[] | undefined,
+		signal: AbortSignal,
+	): Promise<StreamResult & { textItem: DisplayItem | null; reasoningItem: DisplayItem | null }> {
+		const { settings, client } = this.plugin;
+		let reasoningItem: DisplayItem | null = null;
+		let textItem: DisplayItem | null = null;
+
+		let result: StreamResult;
+		try {
+			result = await client.completeStream(
+				outgoing,
+				{
+					model: settings.model,
+					temperature: settings.temperature,
+					maxTokens: settings.maxOutputTokens > 0 ? settings.maxOutputTokens : undefined,
+					tools,
+				},
+				{
+					onReasoning: (_delta, full) => {
+						if (!reasoningItem) {
+							reasoningItem = { role: 'reasoning', text: '', streaming: true };
+							turn.display.push(reasoningItem);
+							this.events.onUpdate();
+						}
+						reasoningItem.text = full;
+						this.events.onToken(reasoningItem);
+					},
+					onText: (_delta, full) => {
+						if (!textItem) {
+							textItem = { role: 'assistant', text: '', streaming: true };
+							turn.display.push(textItem);
+							this.events.onUpdate();
+						}
+						textItem.text = full;
+						this.events.onToken(textItem);
+					},
+				},
+				signal,
+			);
+		} finally {
+			// Finalize even when the stream fails, so no item is left in a
+			// permanently-streaming (plain-text, no actions) state.
+			if (reasoningItem) (reasoningItem as DisplayItem).streaming = false;
+			if (textItem) (textItem as DisplayItem).streaming = false;
+			this.events.onUpdate();
+		}
+
+		if (textItem && result.stats.tokens > 0 && result.stats.seconds >= 1) {
+			(textItem as DisplayItem).stats =
+				`${(result.stats.tokens / result.stats.seconds).toFixed(1)} tok/s`;
+		}
+		return { ...result, textItem, reasoningItem };
+	}
+
+	/** Surface a user-initiated stop in the transcript. */
+	private markStopped(
+		turn: Turn,
+		res: { textItem: DisplayItem | null } | null,
+	): void {
+		if (res?.textItem && !res.textItem.text.trim()) {
+			removeItem(turn.display, res.textItem);
+		}
+		turn.display.push({ role: 'notice', text: 'Stopped.' });
+		this.events.onUpdate();
 	}
 
 	/**
@@ -244,6 +397,7 @@ export class ChatSession {
 	 * assistant(tool_calls) message paired with its tool results.
 	 */
 	private historyForSend(): WireMessage[] {
+		const budget = budgetsFor(this.plugin.settings).history;
 		const included: Turn[] = [];
 		let size = 0;
 		for (let i = this.turns.length - 1; i >= 0; i--) {
@@ -255,7 +409,7 @@ export class ChatSession {
 					(m.tool_calls ? JSON.stringify(m.tool_calls).length : 0),
 				0,
 			);
-			if (included.length > 0 && size + turnSize > MAX_HISTORY_CHARS) break;
+			if (included.length > 0 && size + turnSize > budget) break;
 			included.unshift(turn);
 			size += turnSize;
 		}
@@ -285,12 +439,81 @@ export class ChatSession {
 	}
 
 	/** A fresh note context (message + injected source list), regenerated each send. */
-	private async notesContext(): Promise<NoteContext | null> {
+	private async notesContext(userText: string): Promise<NoteContext | null> {
 		const mode = this.plugin.settings.noteContext;
 		if (mode === 'none') return null;
 		if (mode === 'open') return this.openNotesContext();
 		if (mode === 'linked') return this.linkedNotesContext();
+		if (mode === 'relevant') return this.relevantNotesContext(userText);
 		return this.activeNoteContext();
+	}
+
+	/**
+	 * Auto-RAG context: retrieve the vault content most relevant to the user's
+	 * message (hybrid keyword + semantic) and inject the best excerpts, plus
+	 * the active note. This needs NO tool calls from the model, which makes it
+	 * the most reliable mode for small local models.
+	 */
+	private async relevantNotesContext(userText: string): Promise<NoteContext | null> {
+		const { app, settings } = this.plugin;
+		const budgets = budgetsFor(settings);
+		const file = app.workspace.getActiveFile();
+		const active = file ? await getActiveNote(app) : null;
+
+		const blocks: string[] = [];
+		const sources: string[] = [];
+		let used = 0;
+
+		if (file) {
+			const activeContent = active ? active.content : await app.vault.cachedRead(file);
+			const body = clampText(activeContent, budgets.linkedActive);
+			blocks.push(`<active_note path="${file.path}">\n${body}\n</active_note>`);
+			sources.push(`${file.path} (active note)`);
+			used += body.length;
+		}
+
+		let retrieved: RetrievedNote[] = [];
+		try {
+			retrieved = (
+				await hybridRetrieve(this.plugin, userText, {
+					limit: settings.retrievedMaxNotes,
+					excludePaths: file ? [file.path] : [],
+				})
+			).notes;
+		} catch {
+			// Retrieval must never block sending a message.
+		}
+
+		for (const r of retrieved) {
+			const remaining = budgets.linkedTotal - used;
+			if (remaining <= 0) break;
+			if (!r.excerpt) continue;
+			const body = clampText(r.excerpt, Math.min(remaining, budgets.linkedPerNote));
+			used += body.length;
+			const headingAttr = r.heading ? ` heading="${r.heading}"` : '';
+			blocks.push(
+				`<relevant_note path="${r.path}" match="${r.via}"${headingAttr}>\n${body}\n</relevant_note>`,
+			);
+			sources.push(`${r.path} — ${r.via}${r.heading ? ` (${r.heading})` : ''}`);
+		}
+
+		if (blocks.length === 0) return null;
+
+		const sel = active?.selection
+			? `\nThe user has selected:\n"""\n${active.selection}\n"""`
+			: '';
+		const activeIntro = file
+			? `The user's active note is "${file.path}" (included below). `
+			: '';
+		const header =
+			`${activeIntro}The <relevant_note> blocks are EXCERPTS from vault notes ` +
+			`retrieved as relevant to the user's message — they may be partial. Use ` +
+			`read_note for a note's full content before editing it.${sel}`;
+
+		return {
+			message: { role: 'system', content: `${header}\n\n${blocks.join('\n\n')}` },
+			sources,
+		};
 	}
 
 	/** Cached reverse-link index (target path -> source paths). */
@@ -337,6 +560,7 @@ export class ChatSession {
 	 */
 	private async linkedNotesContext(): Promise<NoteContext | null> {
 		const { app, settings } = this.plugin;
+		const budgets = budgetsFor(settings);
 		const file = app.workspace.getActiveFile();
 		if (!file) return null;
 
@@ -426,12 +650,12 @@ export class ChatSession {
 		const blocks: string[] = [];
 		const sources: string[] = [`${file.path} (active note)`];
 		const omitted: string[] = [];
-		const activeBody = clampText(activeContent, LINKED_ACTIVE_MAX_CHARS);
+		const activeBody = clampText(activeContent, budgets.linkedActive);
 		blocks.push(`<active_note path="${file.path}">\n${activeBody}\n</active_note>`);
 		let used = activeBody.length;
 
 		for (const r of related) {
-			const remaining = LINKED_CONTEXT_MAX_CHARS - used;
+			const remaining = budgets.linkedTotal - used;
 			if (remaining <= 0) {
 				omitted.push(r.path);
 				continue;
@@ -440,7 +664,7 @@ export class ChatSession {
 			if (!(af instanceof TFile)) continue;
 			const body = clampText(
 				await app.vault.cachedRead(af),
-				Math.min(remaining, LINKED_PER_NOTE_MAX_CHARS),
+				Math.min(remaining, budgets.linkedPerNote),
 			);
 			used += body.length;
 			blocks.push(`<related_note path="${r.path}" relation="${r.relation}">\n${body}\n</related_note>`);
@@ -467,7 +691,7 @@ export class ChatSession {
 	private async activeNoteContext(): Promise<NoteContext | null> {
 		const note = await getActiveNote(this.plugin.app);
 		if (!note) return null;
-		const body = clampText(note.content, CONTEXT_MAX_CHARS);
+		const body = clampText(note.content, budgetsFor(this.plugin.settings).activeNote);
 		const selection = note.selection
 			? `\nThe user has selected:\n"""\n${note.selection}\n"""`
 			: '';
@@ -485,6 +709,7 @@ export class ChatSession {
 	/** Context covering every markdown note open in a tab, active note first. */
 	private async openNotesContext(): Promise<NoteContext | null> {
 		const { workspace, vault } = this.plugin.app;
+		const budget = budgetsFor(this.plugin.settings).openNotes;
 		const activePath = workspace.getActiveFile()?.path ?? null;
 		const leaves = workspace.getLeavesOfType('markdown');
 
@@ -525,7 +750,7 @@ export class ChatSession {
 		const sources: string[] = [];
 		const omitted: string[] = [];
 		for (const e of entries) {
-			const remaining = OPEN_NOTES_MAX_CHARS - used;
+			const remaining = budget - used;
 			if (remaining <= 0) {
 				omitted.push(e.path);
 				continue;
@@ -555,6 +780,11 @@ export class ChatSession {
 			sources,
 		};
 	}
+}
+
+function removeItem(list: DisplayItem[], item: DisplayItem): void {
+	const idx = list.indexOf(item);
+	if (idx !== -1) list.splice(idx, 1);
 }
 
 function toolDisplay(name: string, result: string): DisplayItem {
